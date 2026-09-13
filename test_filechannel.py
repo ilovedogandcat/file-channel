@@ -131,7 +131,7 @@ def t_happy_path(tmp):
             files.append(p)
         sh = SendHooks(ctx.logs)
         fc.Sender(files, "127.0.0.1", ctx.port, my_name="发送机", hooks=sh,
-                  log=ctx.log, temp_dir=tmp).start()
+                  log=ctx.log).start()
         ok = sh.done.wait(120)
         check("发送完成", ok and sh.ok is True, sh.msg)
         got = ctx.wait_files(3)
@@ -157,7 +157,7 @@ def t_reject(tmp):
         with open(p, "wb") as f:
             f.write(b"x" * 1000)
         sh = SendHooks()
-        fc.Sender([p], "127.0.0.1", ctx.port, hooks=sh, log=ctx.log, temp_dir=tmp).start()
+        fc.Sender([p], "127.0.0.1", ctx.port, hooks=sh, log=ctx.log).start()
         check("发送线程结束", sh.done.wait(60))
         check("结果=失败", sh.ok is False, sh.msg)
         check("没有落盘", not ctx.wait_files(1, timeout=2))
@@ -175,13 +175,13 @@ def t_pin(tmp):
             f.write(b"y" * 4096)
         sh = SendHooks()
         fc.Sender([p], "127.0.0.1", ctx.port, pin="wrong", hooks=sh,
-                  log=ctx.log, temp_dir=tmp).start()
+                  log=ctx.log).start()
         check("口令错误被拒", sh.done.wait(60) and sh.ok is False, sh.msg)
         ok, msg, _info = fc.probe_peer("127.0.0.1", ctx.port, pin="wrong")
         check("probe 检测出口令不符", ok is False, msg)
         sh2 = SendHooks()
         fc.Sender([p], "127.0.0.1", ctx.port, pin="secret", hooks=sh2,
-                  log=ctx.log, temp_dir=tmp).start()
+                  log=ctx.log).start()
         check("口令正确可发送", sh2.done.wait(60) and sh2.ok is True, sh2.msg)
         check("文件已落盘并完整", any(sha(f) == sha(p) for f in ctx.wait_files(1)))
     finally:
@@ -221,32 +221,70 @@ def t_sanitize(tmp):
         ctx.stop()
 
 
-def t_folder_zip(tmp):
-    print("5) 文件夹自动打包")
+def t_folder_tree(tmp):
+    print("5) 文件夹按目录结构直传（不再打包 zip）")
     src = os.path.join(tmp, "folder1")
-    os.makedirs(os.path.join(src, "sub"), exist_ok=True)
+    os.makedirs(os.path.join(src, "sub", "deep"), exist_ok=True)
+    os.makedirs(os.path.join(src, "empty_dir"), exist_ok=True)
     with open(os.path.join(src, "a.txt"), "w", encoding="utf-8") as f:
         f.write("hello")
     with open(os.path.join(src, "sub", "b.txt"), "w", encoding="utf-8") as f:
         f.write("world")
+    big = os.path.join(src, "sub", "deep", "c.bin")
+    with open(big, "wb") as f:
+        f.write(os.urandom(1 << 20))
     ctx = Ctx(tmp, 4)
     ctx.start(AutoHooks("accept", ctx.logs))
     try:
         sh = SendHooks()
-        fc.Sender([src], "127.0.0.1", ctx.port, hooks=sh, log=ctx.log,
-                  temp_dir=tmp).start()
-        check("打包并发送完成", sh.done.wait(60) and sh.ok is True, sh.msg)
-        got = ctx.wait_files(1)
-        check("收到 zip", bool(got) and got[0].endswith(".zip"), str(got))
-        if got:
-            import zipfile
-            with zipfile.ZipFile(got[0]) as z:
-                names = z.namelist()
-            check("zip 内容正确", any(n.endswith("a.txt") for n in names) and
-                  any(n.endswith("b.txt") for n in names), str(names))
+        fc.Sender([src], "127.0.0.1", ctx.port, hooks=sh, log=ctx.log).start()
+        check("发送完成", sh.done.wait(90) and sh.ok is True, sh.msg)
+        got = ctx.wait_files(3)
+        check("收到 3 个文件", len(got) == 3, str(len(got)))
+        rels = sorted(os.path.relpath(g, ctx.cfg["receive_dir"]).replace("\\", "/") for g in got)
+        ok_tree = (any(r.endswith("folder1/a.txt") for r in rels)
+                   and any(r.endswith("folder1/sub/b.txt") for r in rels)
+                   and any(r.endswith("folder1/sub/deep/c.bin") for r in rels))
+        check("目录结构原样还原", ok_tree, str(rels))
+        top = os.path.commonpath(got) if got else ""
+        check("空文件夹也建了", bool(top) and os.path.isdir(os.path.join(top, "empty_dir")), top)
+        for g in got:
+            if g.endswith("c.bin"):
+                check("大文件内容一致", sha(g) == sha(big))
+        check("接收端没有 zip", not any(r.endswith(".zip") for r in rels), str(rels))
     finally:
         ctx.stop()
 
+
+def t_relpath_traversal(tmp):
+    print("5b) 相对路径里的 ../ 不能跑出接收目录")
+    ctx = Ctx(tmp, 10)
+    ctx.start(AutoHooks("accept", ctx.logs))
+    try:
+        conn = fc.http.client.HTTPConnection("127.0.0.1", ctx.port, timeout=10)
+        body = json.dumps({"from": "attacker", "files": [
+            {"name": "../../evil/evil.txt", "rel": "../../evil/evil.txt", "size": 5}]}).encode()
+        conn.request("POST", "/offer", body=body,
+                     headers={"Content-Length": str(len(body)),
+                              "Content-Type": "application/json"})
+        ans = json.loads(conn.getresponse().read().decode())
+        token = ans.get("token")
+        conn.close()
+        conn = fc.http.client.HTTPConnection("127.0.0.1", ctx.port, timeout=10)
+        conn.putrequest("POST", "/upload")
+        conn.putheader("X-Token", token)
+        conn.putheader("X-Rel-Path", fc.urllib.parse.quote("../../evil/evil.txt"))
+        conn.putheader("Content-Length", "5")
+        conn.endheaders()
+        conn.send(b"hello")
+        r = json.loads(conn.getresponse().read().decode())
+        check("上传被接受（路径已净化）", r.get("ok") is True, str(r))
+        rp = os.path.abspath(ctx.cfg["receive_dir"])
+        sp = os.path.abspath(r.get("path", ""))
+        check("文件落在接收目录内", sp.startswith(rp + os.sep), sp)
+        check("文件名净化正确", os.path.basename(sp) == "evil.txt", sp)
+    finally:
+        ctx.stop()
 
 def t_bad_token(tmp):
     print("6) 没有许可（token）不能上传")
@@ -351,8 +389,7 @@ def t_offer_timeout(tmp):
         old = fc.OFFER_WAIT_SENDER
         fc.OFFER_WAIT_SENDER = 3
         try:
-            fc.Sender([p], "127.0.0.1", ctx.port, hooks=sh, log=ctx.log,
-                      temp_dir=tmp).start()
+            fc.Sender([p], "127.0.0.1", ctx.port, hooks=sh, log=ctx.log).start()
             check("拿到结果", sh.done.wait(30))
             check("结果是失败/超时", sh.ok is False, sh.msg)
         finally:
@@ -366,7 +403,7 @@ def main():
     shutil.rmtree(base, ignore_errors=True)
     os.makedirs(base, exist_ok=True)
     print(f"测试目录：{base}\n")
-    for fn in (t_happy_path, t_reject, t_pin, t_sanitize, t_folder_zip, t_bad_token,
+    for fn in (t_happy_path, t_reject, t_pin, t_sanitize, t_folder_tree, t_relpath_traversal, t_bad_token,
                t_incomplete, t_probe_and_discovery, t_cli, t_offer_timeout):
         try:
             fn(base)

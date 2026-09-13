@@ -27,13 +27,11 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import traceback
 import urllib.parse
 import uuid
-import zipfile
 
 APP_NAME = "FileChannel"
 APP_VERSION = "1.0"
@@ -68,6 +66,17 @@ def safe_name(name: str) -> str:
     if not name or name in (".", ".."):
         name = "unnamed"
     return name[:180]
+
+
+def safe_relpath(rel: str):
+    """把对方给出的相对路径拆成安全的各级名字（丢掉空段、".." 和绝对路径前缀）。"""
+    parts = []
+    for seg in re.split(r"[\\/]+", rel or ""):
+        seg = seg.strip()
+        if not seg or seg in (".", ".."):
+            continue
+        parts.append(safe_name(seg))
+    return parts
 
 
 def unique_path(dirpath: str, filename: str) -> str:
@@ -379,6 +388,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not offer.dest_dir:
             folder = f"{safe_name(offer.sender)}_{time.strftime('%Y%m%d_%H%M%S')}"
             offer.dest_dir = os.path.join(self.state.config["receive_dir"], folder)
+        # 先把目录结构建好（包括只有空目录的情况），这样文件夹层次能原样还原
+        for f in offer.files:
+            parts = safe_relpath(f.get("rel") or f.get("name") or "")
+            if not parts:
+                continue
+            try:
+                if f.get("dir"):
+                    os.makedirs(os.path.join(offer.dest_dir, *parts), exist_ok=True)
+                elif len(parts) > 1:
+                    os.makedirs(os.path.join(offer.dest_dir, *parts[:-1]), exist_ok=True)
+            except Exception as e:
+                self.state.log(f"[警告] 建立目录失败 {'/'.join(parts)}：{e}")
         token = self.state.issue_token(offer)
         self.state.log(f"已接受 {offer.sender} 的传输请求，开始接收…")
         return self._json({"accept": True, "token": token, "offer": offer.id})
@@ -390,12 +411,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         offer = self.state.take_token(token)
         if offer is None:
             return self._json({"ok": False, "error": "token"}, 403)
-        raw_name = urllib.parse.unquote(self.headers.get("X-File-Name") or "")
-        fname = safe_name(raw_name)
+        raw_rel = (urllib.parse.unquote(self.headers.get("X-Rel-Path") or "")
+                   or urllib.parse.unquote(self.headers.get("X-File-Name") or ""))
+        parts = safe_relpath(raw_rel) or ["unnamed"]
+        fname = "/".join(parts)
+        target_dir = os.path.join(offer.dest_dir, *parts[:-1])
+        os.makedirs(target_dir, exist_ok=True)
+        target = unique_path(target_dir, parts[-1])
+        base_dir = os.path.abspath(offer.dest_dir)
+        if not os.path.abspath(target).startswith(base_dir + os.sep):
+            return self._json({"ok": False, "error": "bad path"}, 400)
         total = int(self.headers.get("Content-Length") or 0)
-        dest_dir = offer.dest_dir
-        os.makedirs(dest_dir, exist_ok=True)
-        target = unique_path(dest_dir, fname)
         done = 0
         last_report = 0.0
         try:
@@ -521,11 +547,46 @@ class Discovery(threading.Thread):
 # --------------------------------------------------------------------------
 # 发送端
 # --------------------------------------------------------------------------
-class Sender(threading.Thread):
-    """发送一批文件（后台线程）。"""
+class Source:
+    """一个顶层拖入项：单个文件，或一个文件夹（递归展开成若干文件）。"""
 
-    def __init__(self, paths, host, port, pin="", my_name="", hooks=None, log=None,
-                 temp_dir=None):
+    def __init__(self, top):
+        self.top = os.path.abspath(top)
+        self.is_dir = os.path.isdir(self.top)
+        self.display = os.path.basename(self.top.rstrip("\\/")) or self.top
+        self.files = []          # [(本地路径, 相对路径, 字节数)]
+        self.dirs = []           # 空目录的相对路径
+        self.size = 0
+
+    def scan(self):
+        """展开文件夹：不打包、不产生临时文件。"""
+        if self.is_dir:
+            parent = os.path.dirname(self.top)
+            for root, dirs, files in os.walk(self.top):
+                if not files and not dirs:
+                    self.dirs.append(os.path.relpath(root, parent))
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    try:
+                        size = os.path.getsize(full)
+                    except OSError:
+                        continue
+                    self.files.append((full, os.path.relpath(full, parent), size))
+                    self.size += size
+        elif os.path.isfile(self.top):
+            size = os.path.getsize(self.top)
+            self.files.append((self.top, os.path.basename(self.top), size))
+            self.size = size
+        return self
+
+
+class Sender(threading.Thread):
+    """发送一批文件 / 文件夹（后台线程）。
+
+    文件夹按目录结构**逐个文件直传**，不再压成 zip：立刻开始、不额外占磁盘、不受系统盘空间限制。
+    """
+
+    def __init__(self, paths, host, port, pin="", my_name="", hooks=None, log=None):
         super().__init__(daemon=True)
         self.paths = list(paths)
         self.host = host
@@ -535,34 +596,27 @@ class Sender(threading.Thread):
         self.hooks = hooks
         self.log = log or (lambda m: None)
         self.cancelled = False
-        self.temp_files = []
-        self.temp_dir = temp_dir or tempfile.gettempdir()
+        self.sources = []
 
-    # -- 文件夹自动打包 ---------------------------------------------------
     def prepare(self):
-        """返回 [(本地路径, 显示名, 大小)]，文件夹会被打包成 zip。"""
-        items = []
+        """扫描顶层项，返回 [Source]（只读元数据，不写任何临时文件）。"""
+        sources = []
         for p in self.paths:
-            p = os.path.abspath(p)
-            if os.path.isdir(p):
-                base = os.path.basename(p.rstrip("\\/")) or "folder"
-                tmp = os.path.join(self.temp_dir, f"{base}_{int(time.time())}.zip")
-                self.log(f"正在打包文件夹 {p} …")
-                with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as z:
-                    for root, _dirs, files in os.walk(p):
-                        for fn in files:
-                            full = os.path.join(root, fn)
-                            try:
-                                z.write(full, os.path.relpath(full, os.path.dirname(p)))
-                            except Exception as e:
-                                self.log(f"  [跳过] {full}: {e}")
-                self.temp_files.append(tmp)
-                items.append((tmp, base + ".zip", os.path.getsize(tmp)))
-            elif os.path.isfile(p):
-                items.append((p, os.path.basename(p), os.path.getsize(p)))
-            else:
+            if not os.path.exists(p):
                 self.log(f"[跳过] 不存在：{p}")
-        return items
+                continue
+            src = Source(p).scan()
+            if src.is_dir:
+                self.log(f"扫描文件夹 {src.top}：{len(src.files)} 个文件，{human_size(src.size)}"
+                         + (f"，{len(src.dirs)} 个空目录" if src.dirs else ""))
+            sources.append(src)
+        self.sources = sources
+        if sources and self.hooks and hasattr(self.hooks, "prepared"):
+            try:
+                self.hooks.prepared([(s.display, s.size, len(s.files)) for s in sources])
+            except Exception:
+                pass
+        return sources
 
     def _post_json(self, conn, path, obj, timeout):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -578,12 +632,13 @@ class Sender(threading.Thread):
 
     def run(self):
         try:
-            items = self.prepare()
-            if not items:
+            sources = self.prepare()
+            if not sources:
                 self.log("[错误] 没有可发送的文件")
                 return
-            total = sum(i[2] for i in items)
-            self.log(f"连接 {self.host}:{self.port} …（{len(items)} 个文件，共 {human_size(total)}）")
+            nfiles = sum(len(s.files) for s in sources)
+            total = sum(s.size for s in sources)
+            self.log(f"连接 {self.host}:{self.port} …（{nfiles} 个文件，共 {human_size(total)}）")
 
             # 1) 先握手，确认对面是 FileChannel
             try:
@@ -607,9 +662,15 @@ class Sender(threading.Thread):
             # 2) 发出请求，等对方点“接受”
             try:
                 conn = http.client.HTTPConnection(self.host, self.port, timeout=OFFER_WAIT_SENDER + 30)
+                files_payload = []
+                for s in sources:
+                    for _local, rel, size in s.files:
+                        files_payload.append({"name": rel, "rel": rel, "size": size})
+                    for d in s.dirs:
+                        files_payload.append({"name": d, "rel": d, "size": 0, "dir": True})
                 status, ans = self._post_json(conn, "/offer", {
                     "from": self.my_name,
-                    "files": [{"name": name, "size": size} for _p, name, size in items],
+                    "files": files_payload,
                 }, OFFER_WAIT_SENDER + 30)
                 conn.close()
             except Exception as e:
@@ -628,59 +689,67 @@ class Sender(threading.Thread):
             token = ans.get("token")
             self.log("对方已接受，开始传输…")
 
-            # 3) 逐个上传
+            # 3) 逐个文件上传（复用同一条连接；相对路径带给对方以还原目录结构）
             ok_count = 0
-            for idx, (path, name, size) in enumerate(items):
+            conn = http.client.HTTPConnection(self.host, self.port, timeout=30)
+            for si, s in enumerate(sources):
+                done_bytes = 0
+                for local, rel, size in s.files:
+                    if self.cancelled:
+                        self.log("[已取消] 用户中止")
+                        break
+                    try:
+                        conn.putrequest("POST", "/upload")
+                        conn.putheader("X-Pin", self.pin)
+                        conn.putheader("X-Token", token)
+                        conn.putheader("X-Rel-Path", urllib.parse.quote(rel))
+                        conn.putheader("Content-Length", str(size))
+                        conn.endheaders()
+                        sent = 0
+                        last = 0.0
+                        with open(local, "rb") as f:
+                            while True:
+                                chunk = f.read(CHUNK_SIZE)
+                                if not chunk:
+                                    break
+                                conn.send(chunk)
+                                sent += len(chunk)
+                                now = time.time()
+                                if now - last > 0.2 or sent == size:
+                                    last = now
+                                    if self.hooks:
+                                        self.hooks.progress(si, s.display,
+                                                            done_bytes + sent, s.size)
+                        resp = conn.getresponse()
+                        body = json.loads(resp.read().decode("utf-8") or "{}")
+                        if body.get("ok"):
+                            ok_count += 1
+                        else:
+                            self.log(f"[失败] {rel}：{body.get('error')}")
+                    except Exception as e:
+                        self.log(f"[失败] {rel}：{e}")
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = http.client.HTTPConnection(self.host, self.port, timeout=30)
+                    done_bytes += size
+                    if self.hooks:
+                        self.hooks.progress(si, s.display, done_bytes, s.size)
                 if self.cancelled:
-                    self.log("[已取消] 用户中止")
                     break
-                try:
-                    conn = http.client.HTTPConnection(self.host, self.port, timeout=30)
-                    conn.putrequest("POST", "/upload")
-                    conn.putheader("X-Pin", self.pin)
-                    conn.putheader("X-Token", token)
-                    conn.putheader("X-File-Name", urllib.parse.quote(name))
-                    conn.putheader("Content-Length", str(size))
-                    conn.endheaders()
-                    sent = 0
-                    last = 0.0
-                    with open(path, "rb") as f:
-                        while True:
-                            chunk = f.read(CHUNK_SIZE)
-                            if not chunk:
-                                break
-                            conn.send(chunk)
-                            sent += len(chunk)
-                            now = time.time()
-                            if now - last > 0.2 or sent == size:
-                                last = now
-                                if self.hooks:
-                                    self.hooks.progress(idx, name, sent, size)
-                    resp = conn.getresponse()
-                    body = json.loads(resp.read().decode("utf-8") or "{}")
-                    conn.close()
-                    if body.get("ok"):
-                        ok_count += 1
-                        self.log(f"已发送：{name}（{human_size(size)}）")
-                    else:
-                        self.log(f"[失败] {name}：{body.get('error')}")
-                except Exception as e:
-                    self.log(f"[失败] {name}：{e}")
-            self.log(f"传输结束：成功 {ok_count}/{len(items)}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self.log(f"传输结束：成功 {ok_count}/{nfiles} 个文件")
             if self.hooks:
-                self.hooks.finished(ok_count == len(items),
-                                    f"{ok_count}/{len(items)} 个文件")
+                self.hooks.finished(ok_count == nfiles, f"{ok_count}/{nfiles} 个文件")
         except Exception as e:
             traceback.print_exc()
             self.log(f"[异常] {e}")
             if self.hooks:
                 self.hooks.finished(False, str(e))
-        finally:
-            for t in self.temp_files:
-                try:
-                    os.remove(t)
-                except Exception:
-                    pass
 
 
 def probe_peer(host, port, pin="", timeout=PING_TIMEOUT):
@@ -854,12 +923,15 @@ class GuiHooks:
 
 
 class SendHooks:
-    def __init__(self, app, rowmap):
+    def __init__(self, app, rows):
         self.app = app
-        self.rowmap = rowmap          # name -> tree item id
+        self.rows = rows              # [tree item id]，与顶层拖入项一一对应
+
+    def prepared(self, info):
+        self.app.ui_queue.put(("tx_prepared", info))
 
     def progress(self, idx, name, sent, size):
-        self.app.ui_queue.put(("tx_progress", name, sent, size))
+        self.app.ui_queue.put(("tx_progress", idx, name, sent, size))
 
     def finished(self, ok, msg):
         self.app.ui_queue.put(("tx_finished", ok, msg))
@@ -883,7 +955,7 @@ class App:
         self.root.minsize(860, 620)
 
         self.peers_found = {}          # (ip, port) -> name
-        self.send_rows = {}            # name -> item id
+        self.send_rows = []            # [tree item id]（发送列表，一个顶层项一行）
         self.recv_rows = {}
         self.sender = None
         self.drop_target = DropTarget(self.on_drop)
@@ -1075,7 +1147,7 @@ class App:
         for t in (self.tree_send, self.tree_recv):
             for i in t.get_children():
                 t.delete(i)
-        self.send_rows.clear()
+        self.send_rows = []
         self.recv_rows.clear()
 
     def on_pick_peer(self, _evt=None):
@@ -1206,20 +1278,24 @@ class App:
         self.config["last_peer"] = host
         self.config.save()
 
-        # 建立界面行
-        rows = []
+        # 建立界面行（一个顶层项一行；文件夹的真实大小等扫描完再填）
+        row_ids = []
         for p in paths:
             name = os.path.basename(p.rstrip("\\/")) or p
+            is_dir = os.path.isdir(p)
             try:
-                size = (os.path.getsize(p) if os.path.isfile(p) else 0)
+                size = os.path.getsize(p) if os.path.isfile(p) else 0
             except Exception:
                 size = 0
             iid = self.tree_send.insert("", "end", values=(
-                name, human_size(size) if size else "文件夹", "0%", "等待对方接受…"))
-            self.send_rows[name] = iid
-            rows.append(name)
+                name,
+                human_size(size) if size else ("文件夹" if is_dir else "—"),
+                "0%",
+                "扫描中…" if is_dir else "等待对方接受…"))
+            row_ids.append(iid)
+        self.send_rows = row_ids
 
-        hooks = SendHooks(self, self.send_rows)
+        hooks = SendHooks(self, row_ids)
         self.sender = Sender(paths, host, port, pin=self.var_pin.get() or "",
                              my_name=self.config["name"], hooks=hooks, log=self.log)
         self.sender.start()
@@ -1241,18 +1317,28 @@ class App:
                     self.lbl_status.configure(foreground="#080" if ok else "#a00")
                 elif kind == "offer":
                     self.handle_offer(item[1], item[2])
+                elif kind == "tx_prepared":
+                    for i, (name, size, nfiles) in enumerate(item[1]):
+                        if i >= len(self.send_rows):
+                            break
+                        iid = self.send_rows[i]
+                        shown = human_size(size) if size else "0 B"
+                        if nfiles != 1:
+                            shown += f"（{nfiles} 个文件）"
+                        self.tree_send.set(iid, "size", shown)
+                        self.tree_send.set(iid, "state", "等待对方接受…")
                 elif kind == "tx_progress":
-                    _k, name, sent, size = item
-                    iid = self.send_rows.get(name)
-                    if iid:
+                    _k, idx, _name, sent, size = item
+                    if idx < len(self.send_rows):
+                        iid = self.send_rows[idx]
                         pct = f"{sent * 100 // max(size, 1)}%"
                         self.tree_send.set(iid, "progress", pct)
                         self.tree_send.set(iid, "state", "发送中…")
                 elif kind == "tx_finished":
                     ok, msg = item[1], item[2]
-                    for name, iid in self.send_rows.items():
+                    for iid in self.send_rows:
                         st = self.tree_send.set(iid, "state")
-                        if st in ("等待对方接受…", "发送中…"):
+                        if st in ("等待对方接受…", "发送中…", "扫描中…"):
                             self.tree_send.set(iid, "state", "完成" if ok else f"失败：{msg}")
                             if ok:
                                 self.tree_send.set(iid, "progress", "100%")
@@ -1296,15 +1382,21 @@ class App:
 
         ttk.Label(dlg, text=f"【{offer.peer_name}】 想给你发送文件",
                   font=("Microsoft YaHei UI", 12, "bold")).pack(padx=16, pady=(14, 4))
-        ttk.Label(dlg, text=f"共 {len(offer.files)} 个文件，合计 {human_size(offer.total_size)}"
+        n_files = sum(1 for f in offer.files if not f.get("dir"))
+        ttk.Label(dlg, text=f"共 {n_files} 个文件，合计 {human_size(offer.total_size)}"
                   ).pack(padx=16)
-        tree = ttk.Treeview(dlg, columns=("f", "s"), show="headings", height=min(8, max(3, len(offer.files))))
-        tree.heading("f", text="文件")
+        rows_n = min(12, max(3, len(offer.files)))
+        tree = ttk.Treeview(dlg, columns=("f", "s"), show="headings", height=rows_n)
+        tree.heading("f", text="文件（相对路径）")
         tree.heading("s", text="大小")
-        tree.column("f", width=340)
+        tree.column("f", width=380)
         tree.column("s", width=100, anchor="e")
         for f in offer.files:
-            tree.insert("", "end", values=(f.get("name"), human_size(int(f.get("size") or 0))))
+            label = f.get("rel") or f.get("name") or ""
+            if f.get("dir"):
+                tree.insert("", "end", values=(label + "　（空文件夹）", "—"))
+            else:
+                tree.insert("", "end", values=(label, human_size(int(f.get("size") or 0))))
         tree.pack(padx=16, pady=8, fill="x")
 
         var_auto = tk.BooleanVar(value=False)
