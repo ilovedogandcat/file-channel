@@ -703,6 +703,9 @@ class Sender(threading.Thread):
                         conn.putheader("X-Pin", self.pin)
                         conn.putheader("X-Token", token)
                         conn.putheader("X-Rel-Path", urllib.parse.quote(rel))
+                        # 兼容旧版接收端（只认 X-File-Name：目录层次会丢，但文件名是对的）
+                        conn.putheader("X-File-Name",
+                                       urllib.parse.quote(os.path.basename(rel)))
                         conn.putheader("Content-Length", str(size))
                         conn.endheaders()
                         sent = 0
