@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
+# 运行/测试时产生的临时文件
+_test_run/
+_debug_run/
+_droptest/
+_exe_recv/
+_*.txt
+_*.json
+_*.ps1
+_*.py
+
+# 本地打包的便携 zip（需要时自己重新生成）
+文件通道_便携版.zip
+*.zip
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
